@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.ipynb_checkpoints/
+
+# Local data, models, and run outputs
+/data/
+/models/
+/outputs/
+
+# Credentials
+.env

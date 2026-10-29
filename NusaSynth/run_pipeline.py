@@ -1,0 +1,300 @@
+"""NusaSynth outer loop: run the LangGraph pipeline per language, per label, per batch.
+
+Usage:
+  uv run nusasynth/run_pipeline.py
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from NusaSynth.config import BATCH_SIZE, DATA_DIR, DEDUP_THRESHOLD, LABEL_ORDER, LANG_NAMES, OUTPUT_DIR, SENTENCES_PER_SEED, TARGET_LANGS
+from NusaSynth.graph import build_pipeline
+from NusaSynth.state import SentenceRecord
+from NusaSynth.tools import jaccard_bigram
+from NusaSynth.usage_tracker import get_run_id, init_usage_tracker
+
+# ── Sample config
+SAMPLE_RATIO: float | None = None  # 10% per label — flip to None for full run
+
+
+def compute_seed_profile(train_df: pd.DataFrame, lang: str) -> dict:
+    """Always computed on FULL train_df (not sampled), so stats are accurate.
+
+    Includes length percentiles AND concrete short/medium/long example sentences
+    per label — used to ground Contextualizer/Generator with real seed patterns
+    instead of abstract statistical concepts.
+    """
+    df = train_df.copy()
+    df["word_count"] = df["text"].str.split().str.len()
+
+    length_stats: dict = {}
+    length_examples: dict = {}
+
+    for label, group in df.groupby("label"):
+        wc = group["word_count"]
+        length_stats[label] = {
+            "mean": round(float(wc.mean()), 1),
+            "std": round(float(wc.std()), 1),
+            "p10": int(wc.quantile(0.10)),
+            "p25": int(wc.quantile(0.25)),
+            "p50": int(wc.quantile(0.50)),
+            "p75": int(wc.quantile(0.75)),
+            "p90": int(wc.quantile(0.90)),
+            "p95": int(wc.quantile(0.95)),
+            "min": int(wc.min()),
+            "max": int(wc.max()),
+        }
+        # Pick 3 example sentences spanning the length range
+        sorted_g = group.sort_values("word_count").reset_index(drop=True)
+        n = len(sorted_g)
+        length_examples[label] = {
+            "short":  sorted_g.iloc[max(0, int(n * 0.10))]["text"],
+            "medium": sorted_g.iloc[int(n * 0.50)]["text"],
+            "long":   sorted_g.iloc[min(n - 1, int(n * 0.90))]["text"],
+        }
+
+    return {
+        "lang": lang,
+        "label_distribution": train_df["label"].value_counts().to_dict(),
+        "avg_length_per_label": length_stats,  # keep key for backwards compat
+        "length_examples_per_label": length_examples,
+        "unit": "words",
+    }
+
+
+def sample_seeds(seeds: list[dict], ratio: float | None, seed: int = 42) -> list[dict]:
+    """Random sample a proportional subset from seeds. Returns all if ratio is None."""
+    if ratio is None or ratio >= 1.0:
+        return seeds
+    import random
+    rng = random.Random(seed)
+    n = max(1, int(len(seeds) * ratio))
+    return rng.sample(seeds, n)
+
+
+def chunk(lst: list, size: int) -> list[list]:
+    return [lst[i : i + size] for i in range(0, len(lst), size)]
+
+
+def free_nusabert_cache() -> None:
+    """Lepas model NusaBERT bahasa yang sudah selesai dari VRAM (~1.35 GB/bahasa).
+
+    tools.py cache model per-bahasa dan tak pernah melepasnya. Tanpa ini, run 7 bahasa
+    dalam SATU proses menumpuk ~9.5 GB > VRAM 8.6 GB -> spill ke shared RAM (lambat),
+    padahal model bahasa lama sudah tidak dipakai. Cache tetap berguna DALAM satu bahasa
+    (antar-batch); dilepas hanya saat pindah bahasa. tools.py TIDAK disentuh.
+    """
+    import gc
+
+    import torch
+
+    from NusaSynth import tools
+
+    tools._nusabert_cache.clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def save_results(
+    lang: str,
+    label: str,
+    accepted: list[SentenceRecord],
+    discarded: list[SentenceRecord],
+    retried: list[SentenceRecord],
+    output_dir: Path,
+    batch_idx: int | None = None,
+    batch_seed_ids: list[int] | None = None,
+) -> tuple[int, int]:
+    """Save accepted → CSV, full state log → JSONL (accepted + discarded + retried).
+
+    Returns (kept_count, dedup_filtered_count) — actual yield post cross-batch dedup.
+
+    Cross-batch Jaccard dedup: new accepted sentences are checked against
+    existing CSV rows. Near-duplicates are logged as 'dedup_filtered'.
+
+    Batch failure detection: if accepted+discarded+retried all empty,
+    log a 'batch_failed' entry (Contextualizer/Generator validation failed
+    after retry → batch dibuang seluruhnya).
+    """
+    lang_dir = output_dir / lang
+    lang_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = lang_dir / "pipeline_log.jsonl"
+
+    # Detect entire batch failure (no output at all)
+    if not accepted and not discarded and not retried:
+        if batch_idx is not None and batch_seed_ids is not None:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "outcome": "batch_failed",
+                    "target_lang": lang,
+                    "target_label": label,
+                    "batch_idx": batch_idx,
+                    "seed_ids": batch_seed_ids,
+                    "expected_sentences": len(batch_seed_ids) * SENTENCES_PER_SEED,
+                }, ensure_ascii=False) + "\n")
+            print(f"  BATCH_FAILED: lang={lang} label={label} batch={batch_idx} seeds={batch_seed_ids}")
+        return 0, 0
+
+    csv_path = lang_dir / "synthetic.csv"
+
+    # Load existing texts for cross-batch dedup
+    existing_texts: list[str] = []
+    if csv_path.exists() and csv_path.stat().st_size > 0:
+        existing_df = pd.read_csv(csv_path)
+        existing_texts = existing_df["text"].tolist()
+
+    # Cross-batch Jaccard filter
+    kept: list[SentenceRecord] = []
+    filtered: list[SentenceRecord] = []
+    for sent in accepted:
+        is_dup = any(
+            jaccard_bigram(sent["text"], ref) >= DEDUP_THRESHOLD
+            for ref in existing_texts
+        )
+        if is_dup:
+            filtered.append(sent)
+        else:
+            kept.append(sent)
+            existing_texts.append(sent["text"])
+
+    if filtered:
+        print(f"  Dedup antar-batch: {len(filtered)} difilter, {len(kept)} disimpan")
+
+    # Write kept sentences to CSV
+    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["id", "text", "label"])
+        if write_header:
+            writer.writeheader()
+        for sent in kept:
+            writer.writerow({
+                "id": sent["sid"],
+                "text": sent["text"],
+                "label": label,
+            })
+
+    # Write log (all outcomes, sorted by sid for chronological order)
+    all_logs = (
+        [{**dict(s), "outcome": "accepted"} for s in kept]
+        + [{**dict(s), "outcome": "dedup_filtered"} for s in filtered]
+        + [{**dict(s), "outcome": "discarded"} for s in discarded]
+        + [{**dict(s), "outcome": "retried"} for s in retried]
+    )
+    all_logs.sort(key=lambda r: r["sid"])
+
+    with open(log_path, "a", encoding="utf-8") as f:
+        for entry in all_logs:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    return len(kept), len(filtered)
+
+
+def run_language(lang: str | list[str], labels: list[str] | None = None):
+    init_usage_tracker(OUTPUT_DIR.parent / "usage")
+
+    run_id = get_run_id()
+    run_dir = OUTPUT_DIR / run_id if run_id else OUTPUT_DIR
+    print(f"Output run ini -> {run_dir}/<lang>/")
+
+    if isinstance(lang, str):
+        langs = [lang]
+    else:
+        langs = list(lang)
+
+    for idx, single_lang in enumerate(langs):
+        if len(langs) > 1:
+            print(f"\n{'#'*60}")
+            print(f"# Bahasa {idx + 1}/{len(langs)}: {single_lang}")
+            print(f"{'#'*60}")
+        _run_single_language(single_lang, labels, run_dir)
+        free_nusabert_cache()  # VRAM: model bahasa ini selesai, lepas sebelum bahasa berikutnya
+
+
+def _run_single_language(lang: str, labels: list[str] | None = None, run_dir: Path | None = None):
+    run_dir = run_dir or OUTPUT_DIR
+    lang_name = LANG_NAMES[lang]
+    print(f"\n{'='*60}")
+    print(f"NusaSynth: {lang_name} ({lang})")
+    if SAMPLE_RATIO is not None:
+        print(f"  MODE SAMPLE: {SAMPLE_RATIO:.0%} per label")
+    print(f"{'='*60}")
+
+    train_path = DATA_DIR / lang / "train.csv"
+    if not train_path.exists():
+        print(f"ERROR: Data train gak ketemu: {train_path}")
+        return
+
+    train_df = pd.read_csv(train_path)
+    profile = compute_seed_profile(train_df, lang)
+    print(f"Seed profile (full): {profile['label_distribution']}")
+
+    pipeline = build_pipeline()
+    target_labels = labels or LABEL_ORDER
+    total_accepted = 0
+    total_dedup_filtered = 0
+    total_discarded = 0
+
+    for label in target_labels:
+        all_label_seeds = train_df[train_df["label"] == label].to_dict("records")
+        label_seeds = sample_seeds(all_label_seeds, SAMPLE_RATIO)
+        batches = chunk(label_seeds, BATCH_SIZE)
+
+        if SAMPLE_RATIO is not None:
+            print(f"\n--- {lang_name} [{label}]: {len(label_seeds)}/{len(all_label_seeds)} seeds (sampled) -> {len(batches)} batch ---")
+        else:
+            print(f"\n--- {lang_name} [{label}]: {len(label_seeds)} seeds -> {len(batches)} batch ---")
+
+        for batch_idx, batch in enumerate(batches):
+            print(f"\nBatch {batch_idx + 1}/{len(batches)} [{lang} {label}]: seed_ids={[s['id'] for s in batch]}")
+
+            result = pipeline.invoke(
+                {
+                    "seeds": batch,
+                    "seed_profile": profile,
+                    "target_label": label,
+                    "target_lang": lang,
+                    "lang_name": lang_name,
+                },
+                {"recursion_limit": 50},
+            )
+
+            accepted = result.get("all_accepted", [])
+            discarded = result.get("all_discarded", [])
+            retried = result.get("all_retried", [])
+            print(f"  -> {len(accepted)} diterima, {len(discarded)} dibuang, {len(retried)} diretry")
+
+            kept_count, dedup_count = save_results(
+                lang, label, accepted, discarded, retried, run_dir,
+                batch_idx=batch_idx,
+                batch_seed_ids=[s["id"] for s in batch],
+            )
+            total_accepted += kept_count
+            total_dedup_filtered += dedup_count
+            total_discarded += len(discarded)
+
+    print(f"\n{lang_name} selesai: {total_accepted} diterima, "
+          f"{total_dedup_filtered} dedup-filtered, {total_discarded} dibuang")
+    print(f"Disimpan ke: {run_dir / lang / 'synthetic.csv'}")
+
+
+if __name__ == "__main__":
+    from NusaSynth.config import PIPELINE_MODE
+
+    if PIPELINE_MODE == "single_llm":
+        from NusaSynth.single_llm import run_single_llm_language
+        run_single_llm_language(TARGET_LANGS)
+    else:
+        run_language(TARGET_LANGS)
